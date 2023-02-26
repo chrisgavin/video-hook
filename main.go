@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
@@ -17,6 +18,9 @@ const deviceDetectionMask = inotify.InCreate
 const deviceUsageMask = inotify.InOpen | inotify.InClose
 
 func isVideoDevice(name string) bool {
+	if strings.HasPrefix(name, "/") && !strings.HasPrefix(name, devDirectory+"/") {
+		return false
+	}
 	_, basename := path.Split(name)
 	return strings.HasPrefix(basename, "video")
 }
@@ -55,6 +59,38 @@ func run() error {
 		}
 	}
 
+	deviceChanged := func() {
+		log.Infof("Checking for references to video devices.")
+		processes, err := ioutil.ReadDir("/proc")
+		if err != nil {
+			log.Errorf("Error reading /proc: %s", err)
+			return
+		}
+		for _, process := range processes {
+			if !process.IsDir() {
+				continue
+			}
+			processID := process.Name()
+			fds, err := ioutil.ReadDir(path.Join("/proc", processID, "fd"))
+			if err != nil {
+				continue
+			}
+			for _, fd := range fds {
+				link, err := os.Readlink(path.Join("/proc", processID, "fd", fd.Name()))
+				if err != nil {
+					continue
+				}
+				if isVideoDevice(link) {
+					log.WithFields(log.Fields{"device": link, "process": processID}).Infof("Found reference to device.")
+					deviceOpened()
+					return
+				}
+			}
+		}
+		log.Infof("No references to video devices found.")
+		deviceClosed()
+	}
+
 	watcher, err := inotify.NewWatcher()
 	if err != nil {
 		return err
@@ -84,18 +120,38 @@ func run() error {
 		select {
 		case event := <-watcher.Event:
 			if event.Mask&inotify.InOpen != 0 {
-				log.WithFields(log.Fields{"device": event.Name}).Info("Device opened.")
-				debounced(deviceOpened)
+				log.WithFields(log.Fields{"device": event.Name, "mask": event.Mask}).Info("Device opened.")
+				debounced(func() {
+					deviceChanged()
+				})
 			}
 			if event.Mask&inotify.InClose != 0 {
-				log.WithFields(log.Fields{"device": event.Name}).Info("Device closed.")
-				debounced(deviceClosed)
+				log.WithFields(log.Fields{"device": event.Name, "mask": event.Mask}).Info("Device closed.")
+				debounced(func() {
+					deviceChanged()
+				})
 			}
 			if event.Mask&inotify.InCreate != 0 && isVideoDevice(event.Name) {
-				log.WithFields(log.Fields{"device": event.Name}).Info("Device detected.")
-				err := watcher.AddWatch(event.Name, deviceUsageMask)
-				if err != nil {
-					log.Errorf("%+v", err)
+				logWithFields := log.WithFields(log.Fields{"device": event.Name})
+				logWithFields.Info("Device detected.")
+				attempts := 0
+				for {
+					watcher.RemoveWatch(event.Name)
+					err := watcher.AddWatch(event.Name, deviceUsageMask)
+					if err == nil {
+						logWithFields.Info("Added watch for device.")
+						break
+					} else {
+						attempts++
+						if attempts > 5 {
+							logWithFields.Errorf("%+v", err)
+							break
+						} else {
+							logWithFields.Warnf("%+v", err)
+							time.Sleep(1 * time.Second)
+							logWithFields.Info("Retrying...")
+						}
+					}
 				}
 			}
 		case err := <-watcher.Error:
