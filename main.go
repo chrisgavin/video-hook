@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -81,6 +82,10 @@ func run() error {
 					continue
 				}
 				if isVideoDevice(link) {
+					if _, err := os.Stat(link); errors.Is(err, os.ErrNotExist) {
+						log.WithFields(log.Fields{"device": link, "process": processID}).Infof("Found reference to device, but it no longer exists.")
+						continue
+					}
 					log.WithFields(log.Fields{"device": link, "process": processID}).Infof("Found reference to device.")
 					deviceOpened()
 					return
